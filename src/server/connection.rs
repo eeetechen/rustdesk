@@ -198,6 +198,11 @@ lazy_static::lazy_static! {
     pub static ref CONTROL_PERMISSIONS_ARRAY: Arc::<Mutex<Vec<(i32, ControlPermissions)>>> = Default::default();
     static ref WAKELOCK_SENDER: Arc::<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = Arc::new(Mutex::new(start_wakelock_thread()));
     static ref WAKELOCK_KEEP_AWAKE_OPTION: Arc::<Mutex<Option<bool>>> = Default::default();
+    // Per video service, when a key frame was last requested for it and how long the next
+    // request has to wait. A refresh restarts that service's encoder, so the cost is per display
+    // rather than per connection: keying this by connection would restart one encoder once per
+    // slow viewer.
+    static ref KEY_FRAME_REQUESTS: Arc::<Mutex<HashMap<String, KeyFrameBudget>>> = Default::default();
 }
 
 #[cfg(feature = "flutter")]
@@ -508,6 +513,14 @@ const MILLI1: Duration = Duration::from_millis(1);
 const SEND_TIMEOUT_VIDEO: u64 = 12_000;
 const SEND_TIMEOUT_OTHER: u64 = SEND_TIMEOUT_VIDEO * 10;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// A video frame this old can no longer be shown at the time it was captured; sending it only
+/// adds to the backlog ahead of the next one. The control channel already drops audio on the
+/// same age, and video is the channel whose backlog is the delay.
+const VIDEO_FRAME_STALE: Duration = Duration::from_millis(1000);
+/// Frames a connection may have queued for the video channel before the queue starts shedding
+/// the oldest non-key frame. Four frames is about one refresh at 60 fps: enough to ride out a
+/// burst, short enough that a slow link cannot bank seconds of delay in the queue.
+const VIDEO_SEND_BACKLOG: usize = 4;
 
 /// Whether the DRM backend can serve a Wayland login screen here.
 ///
@@ -521,6 +534,80 @@ fn drm_can_serve_login_screen() -> bool {
 #[cfg(all(target_os = "linux", not(feature = "drm")))]
 fn drm_can_serve_login_screen() -> bool {
     false
+}
+
+/// Whether any of the encoded frames carried in this message is a key frame.
+///
+/// A viewer can only start or resume on one, so it is never worth shedding; a delta frame on a
+/// link that cannot keep up is worth nothing at all.
+fn video_frame_has_key_frame(msg: &Message) -> bool {
+    use video_frame::Union::*;
+    match &msg.union {
+        Some(message::Union::VideoFrame(vf)) => match &vf.union {
+            Some(Vp8s(f)) | Some(Vp9s(f)) | Some(Av1s(f)) | Some(H264s(f)) | Some(H265s(f)) => {
+                f.frames.iter().any(|e| e.key)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// What one video service has spent on key frame requests and when it may spend again.
+#[derive(Default)]
+struct KeyFrameBudget {
+    last_request: Option<Instant>,
+    interval: Option<Duration>,
+}
+
+/// How long a shed frame keeps the next key frame request for its display waiting, and the
+/// ceiling that wait grows to while the sheds keep coming.
+const KEY_FRAME_INTERVAL: Duration = Duration::from_secs(1);
+const KEY_FRAME_INTERVAL_MAX: Duration = Duration::from_secs(30);
+/// Shedding absent for this long means the link recovered, so the next shed starts over at the
+/// shortest wait instead of inheriting the last congestion episode's backoff.
+const KEY_FRAME_RECOVERY: Duration = Duration::from_secs(10);
+
+/// The wait before the next key frame request may be spent on a display.
+///
+/// Each request that is followed by more shedding doubles the wait, because a key frame is the
+/// largest frame in the stream: on a link that cannot carry the stream at all, spending one every
+/// second restarts the encoder forever without making the frames fit. The wait is capped so the
+/// viewer can still recover, and drops back to the shortest wait once shedding stops, which is
+/// when a request has a chance of helping again.
+fn key_frame_interval(last: Option<Duration>, shed_recently: bool) -> Duration {
+    match last.filter(|_| shed_recently) {
+        Some(last) => (last * 2).min(KEY_FRAME_INTERVAL_MAX),
+        None => KEY_FRAME_INTERVAL,
+    }
+}
+
+/// Claims the right to request a key frame for `service`.
+///
+/// Several viewers of one display can shed frames at the same time, and a refresh restarts that
+/// display's encoder once for all of them. The rate limit therefore belongs to the service, not
+/// to the connection: one per connection per wait would restart a shared encoder once per slow
+/// viewer, at a key frame's worth of bandwidth each time.
+fn claim_key_frame_request(service: &str, shed_recently: bool) -> bool {
+    let now = Instant::now();
+    let mut requests = KEY_FRAME_REQUESTS.lock().unwrap();
+    let budget = requests.entry(service.to_owned()).or_default();
+    let interval = key_frame_interval(budget.interval, shed_recently);
+    if budget
+        .last_request
+        .is_some_and(|t| now.duration_since(t) < interval)
+    {
+        return false;
+    }
+    budget.last_request = Some(now);
+    budget.interval = Some(interval);
+    // Services outlive neither a display going away nor the process, but a long run can still see
+    // displays come and go; drop anything old enough that it cannot rate limit a live request.
+    requests.retain(|_, b| {
+        b.last_request
+            .is_some_and(|t| now.duration_since(t) < Duration::from_secs(120))
+    });
+    true
 }
 
 impl Connection {
@@ -704,6 +791,18 @@ impl Connection {
             crate::rustdesk_interval(time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT));
         let mut last_recv_time = Instant::now();
         let started = Instant::now();
+        // Set when a video frame is shed: the viewer's decoder is then on a chain that skips a
+        // frame, and every delta frame after it decodes against the wrong reference until a key
+        // frame arrives. The request is deferred to the timer below, because the queue that
+        // caused the shed has no room for the key frame it would produce. The display is the one
+        // the shed frame carried, which a pending switch can make differ from `display_idx`.
+        let mut video_key_frame_wanted: Option<usize> = None;
+        // When this connection last shed a frame. A request that is followed by more shedding has
+        // not helped, so the next one waits longer.
+        let mut video_last_shed: Option<Instant> = None;
+        // The last frame of each display that actually reached the viewer, so a shed can tell
+        // whether the key frame it is about to wait for has since overtaken it.
+        let mut video_last_sent: HashMap<usize, (bool, Instant)> = HashMap::new();
 
         // The connection type is not known until the login request arrives;
         // `on_message` picks the type-specific timeout then.
@@ -1077,9 +1176,70 @@ impl Connection {
                     }
                 }
                 Some((instant, value)) = rx_video.recv() => {
+                    // A frame that waited this long, or that still has this much queued behind
+                    // it, can no longer be shown near when it was captured. Sending it would
+                    // put it ahead of a fresher one and add its age to the viewer's delay, so
+                    // it goes instead. Key frames are kept however late: a viewer needs one to
+                    // resume, and dropping it would cost a whole refresh.
+                    let age = instant.elapsed();
+                    let key = video_frame_has_key_frame(&value);
+                    if !key && (age > VIDEO_FRAME_STALE || rx_video.len() >= VIDEO_SEND_BACKLOG) {
+                        // The frame does not reach the viewer, so the acknowledgement it would
+                        // have produced never arrives either. Report it here, or an encoder
+                        // waiting on per-frame acks stalls for the whole wait window.
+                        if let Some(message::Union::VideoFrame(vf)) = &value.union {
+                            let display = vf.display as usize;
+                            video_service::notify_video_frame_fetched(
+                                display,
+                                id,
+                                Some(instant.into()),
+                            );
+                            // The probe cannot see this: the queue is short because these frames
+                            // were thrown away, so the round trip reports a healthy path while
+                            // the viewer is missing frames. Report the loss as its own evidence,
+                            // or the controller holds its bitrate and the shedding never ends.
+                            video_service::VIDEO_QOS
+                                .lock()
+                                .unwrap()
+                                .user_video_frame_shed(id);
+                            // A key frame sent since this one was queued already repaired the
+                            // chain, and it covers every frame that follows it. This one is older
+                            // than that repair, so dropping it leaves the viewer whole; asking
+                            // for another refresh would only cost a second key frame.
+                            let repaired = video_last_sent
+                                .get(&display)
+                                .is_some_and(|(sent_key, sent_at)| *sent_key && *sent_at >= instant);
+                            if !repaired {
+                                video_key_frame_wanted = Some(display);
+                            }
+                            video_last_shed = Some(Instant::now());
+                        }
+                        // Record the intent rather than refreshing here. This branch runs while
+                        // the queue is full, and a refresh restarts the encoder and emits a key
+                        // frame - the largest frame in the stream. Spending that now deepens the
+                        // very backlog that made it necessary. The timer below issues it once the
+                        // queue has drained and there is room for it.
+                        hbb_common::throttled_log!(
+                            Duration::from_secs(3),
+                            info,
+                            "drop stale video frame, queued={} age={}ms",
+                            rx_video.len(),
+                            age.as_millis()
+                        );
+                        continue;
+                    }
                     if !conn.video_ack_required {
                         if let Some(message::Union::VideoFrame(vf)) = &value.union {
                             video_service::notify_video_frame_fetched(vf.display as usize, id, Some(instant.into()));
+                        }
+                    }
+                    // A key frame that reaches the viewer ends the chain the shed broke, whether
+                    // it came from the request above or from a refresh someone else asked for.
+                    if let Some(message::Union::VideoFrame(vf)) = &value.union {
+                        let display = vf.display as usize;
+                        video_last_sent.insert(display, (key, instant));
+                        if key && video_key_frame_wanted == Some(display) {
+                            video_key_frame_wanted = None;
                         }
                     }
                     if let Err(err) = conn.stream.send(&value as &Message).await {
@@ -1183,6 +1343,22 @@ impl Connection {
                     conn.file_remove_log_control.on_timer().drain(..).map(|x| conn.send_to_cm(x)).count();
                     #[cfg(feature = "hwcodec")]
                     conn.update_supported_encoding();
+                    // Issue a key frame request once the queue it was raised against has drained,
+                    // so the refresh is not competing with the backlog that provoked it. The claim
+                    // keeps a sustained burst of sheds to one refresh per display per second.
+                    if let Some(display) = video_key_frame_wanted
+                        .filter(|_| rx_video.len() < VIDEO_SEND_BACKLOG)
+                    {
+                        let service =
+                            video_service::get_service_name(conn.video_source(), display);
+                        let shed_recently = video_last_shed
+                            .is_some_and(|t| t.elapsed() < KEY_FRAME_RECOVERY);
+                        if claim_key_frame_request(&service, shed_recently) {
+                            video_key_frame_wanted = None;
+                            conn.refresh_video_display(Some(display));
+                            log::info!("Requested a key frame after shedding video frames");
+                        }
+                    }
                 }
                 _ = test_delay_timer.tick() => {
                     if last_recv_time.elapsed() >= SEC30 {
@@ -7429,6 +7605,64 @@ mod test {
         };
         assert_ne!(scope(&first), scope(&terminal("")));
         assert_ne!(scope(&terminal("a")), scope(&terminal("b")));
+    }
+
+    /// The shed decision turns on this: a key frame is what a viewer resumes from, so it is kept
+    /// however late, while a delta frame on a link that is already behind is worth nothing.
+    #[test]
+    fn test_video_frame_has_key_frame() {
+        fn encoded(key: bool) -> VideoFrame {
+            let mut frame = EncodedVideoFrame::new();
+            frame.key = key;
+            let mut frames = EncodedVideoFrames::new();
+            frames.frames.push(frame);
+            let mut vf = VideoFrame::new();
+            vf.set_h264s(frames);
+            vf
+        }
+        fn wrap(vf: VideoFrame) -> Message {
+            let mut msg = Message::new();
+            msg.set_video_frame(vf);
+            msg
+        }
+
+        assert!(video_frame_has_key_frame(&wrap(encoded(true))));
+        assert!(!video_frame_has_key_frame(&wrap(encoded(false))));
+        // Anything without encoded video in it is not a key frame, so it is not exempt.
+        assert!(!video_frame_has_key_frame(&Message::new()));
+        let mut audio = Message::new();
+        audio.set_audio_frame(AudioFrame::new());
+        assert!(!video_frame_has_key_frame(&audio));
+    }
+
+    #[test]
+    fn test_claim_key_frame_request_is_per_service() {
+        // Two viewers of the same display shed frames together; the refresh they would each ask
+        // for is the same encoder restart, so only the first may spend it.
+        assert!(claim_key_frame_request("monitor-test-shared", false));
+        assert!(!claim_key_frame_request("monitor-test-shared", false));
+        // A second display is a second encoder, and its own budget.
+        assert!(claim_key_frame_request("monitor-test-other", false));
+        // Claiming one display does not consume the other's, and the first stays spent.
+        assert!(!claim_key_frame_request("monitor-test-shared", false));
+        assert!(!claim_key_frame_request("monitor-test-other", false));
+    }
+
+    #[test]
+    fn test_key_frame_interval_backs_off_while_shedding_continues() {
+        // The first shed waits the shortest interval.
+        assert_eq!(key_frame_interval(None, true), KEY_FRAME_INTERVAL);
+        // Every request that is followed by more shedding doubles the wait, up to the cap: a key
+        // frame is the largest frame in the stream, so repeating it on a link that cannot carry
+        // the stream only restarts the encoder.
+        let mut last = KEY_FRAME_INTERVAL;
+        for expected in [2u32, 4, 8, 16, 30, 30] {
+            last = key_frame_interval(Some(last), true);
+            assert_eq!(last, Duration::from_secs(expected as u64));
+        }
+        // Once the shedding stops, the next request starts over at the shortest wait rather than
+        // inheriting the backoff of a congestion episode that has ended.
+        assert_eq!(key_frame_interval(Some(last), false), KEY_FRAME_INTERVAL);
     }
 
     #[test]

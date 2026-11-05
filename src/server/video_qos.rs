@@ -82,6 +82,12 @@ struct UserDelay {
     samples_since_restore: Option<u8>,  // set by a restore, cleared once it proved stable
     stall_reference_fps: Option<u32>,   // fps when the outstanding probe passed two seconds
     startup_good_samples: u8,           // u8::MAX permanently ends startup acceleration
+    // Frames shed since the last probe reply, and how many replies in a row arrived with any.
+    // Shedding is what keeps the send queue short, and the probe reads that queue, so a link
+    // that sheds every interval reports a healthy delay while dropping frames. Without these
+    // the controller would hold its bitrate and go on shedding for good.
+    shed_pending: u8,
+    shed_samples: u8,
 }
 
 impl UserDelay {
@@ -104,6 +110,16 @@ impl UserDelay {
         let delay = delay.saturating_sub(self.rtt_calculator.get_rtt().unwrap_or_default());
         if let Some(samples) = self.samples_since_restore.as_mut() {
             *samples = samples.saturating_add(1);
+        }
+        // Shedding is the one congestion signal the round trip cannot carry: the queue stayed
+        // short precisely because the frames were thrown away, so every reply reads healthy.
+        // Take the step a full second of delay would take, and let the ratio path own the
+        // bitrate while it still can.
+        if self.shed_samples >= 2 && !bitrate_first {
+            self.consecutive_bad_samples = (self.consecutive_bad_samples + 1).min(3);
+            self.on_reduction(current_fps);
+            // Halve, but never raise: an fps already below the halved level stays where it is.
+            return fps.min(current_fps.saturating_sub((current_fps / 2).max(1)));
         }
         if delay < DELAY_THRESHOLD_150MS {
             self.consecutive_bad_samples = 0;
@@ -218,7 +234,7 @@ impl UserDelay {
     // outstanding at the second tick past two seconds.  One slow reply or one short
     // stall is jitter, and a static screen would never earn the cut back.
     fn needs_bitrate_reduction(&self) -> bool {
-        self.consecutive_bad_samples >= 2 || self.stall_ticks >= 2
+        self.consecutive_bad_samples >= 2 || self.stall_ticks >= 2 || self.shed_samples >= 2
     }
 
     // The bitrate step this viewer's own evidence calls for, None when it calls for
@@ -228,8 +244,15 @@ impl UserDelay {
         if !self.needs_bitrate_reduction() {
             return None;
         }
-        let excess = self.avg_delay();
-        let confirmed = self.consecutive_bad_samples >= 3;
+        let confirmed = self.consecutive_bad_samples >= 3 || self.shed_samples >= 3;
+        // A link that shed frames kept its queue short by throwing them away, so the delay it
+        // reports is the delay of a queue that never grew.  Shedding alone therefore floors the
+        // excess at the first severity step instead of reading as a healthy link.
+        let excess = if self.shed_samples >= 2 {
+            self.avg_delay().max(200)
+        } else {
+            self.avg_delay()
+        };
         Some(if excess < 200 {
             0.95
         } else if excess < 300 {
@@ -432,6 +455,18 @@ impl VideoQoS {
         }
     }
 
+    /// Records that a frame was shed for this viewer because its send queue outgrew the link.
+    ///
+    /// Shedding is congestion the delay probe cannot see: the queue is short *because* the
+    /// frames were dropped, so the round trip measures a healthy path while the picture is
+    /// missing frames. Counting it here gives the controller the sample it would otherwise
+    /// never receive.
+    pub fn user_video_frame_shed(&mut self, id: i32) {
+        if let Some(user) = self.users.get_mut(&id) {
+            user.delay.shed_pending = user.delay.shed_pending.saturating_add(1);
+        }
+    }
+
     pub fn user_image_quality(&mut self, id: i32, image_quality: i32) {
         let convert_quality = |q: i32| -> Quality {
             if q == ImageQuality::Balanced.value() {
@@ -482,6 +517,10 @@ impl VideoQoS {
         let mut reduce_bitrate = false;
         if let Some(user) = self.users.get_mut(&id) {
             let delay = delay.max(10);
+            // One sample per reply, like the delay itself: how many frames were shed while the
+            // probe was out. Frames shed before the previous reply were already answered for.
+            user.delay.shed_samples = user.delay.shed_pending;
+            user.delay.shed_pending = 0;
             // The reply closes the outstanding probe, braked or not.
             user.delay.stall_ticks = 0;
             let braked = user.delay.stall_reference_fps.take().is_some();

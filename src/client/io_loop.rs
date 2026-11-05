@@ -1567,6 +1567,7 @@ impl<T: InvokeUiSession> Remote<T> {
             .map(|v| v.1.video_queue.read().unwrap().len())
             .max()
             .unwrap_or_default();
+        let queue_idle = max_queue_len <= 1;
         let min_decode_fps = self
             .video_threads
             .iter()
@@ -1577,14 +1578,40 @@ impl<T: InvokeUiSession> Remote<T> {
         let Some(min_decode_fps) = min_decode_fps else {
             return;
         };
-        let mut limited_fps = if direct {
-            min_decode_fps * 9 / 10 // 30 got 27
-        } else {
-            min_decode_fps * 4 / 5 // 30 got 24
-        };
-        if limited_fps > custom_fps {
-            limited_fps = custom_fps;
+        // The measured rate is what the sender was asked for, so it says how many frames arrived,
+        // not how many could have. Using it directly as the target would hold the stream one step
+        // below itself forever: ask for N, measure N, ask for N again. A rate that arrived with
+        // the queue empty is instead evidence of headroom, so remember it as a confirmed floor and
+        // keep probing above it until a backlog says to come back down.
+        for thread in self.video_threads.values_mut() {
+            let measured = *thread.decode_fps.read().unwrap();
+            let ctl = &mut thread.fps_control;
+            if ctl.inactive_counter >= inactive_threshold {
+                continue;
+            }
+            if queue_idle {
+                if let Some(measured) = measured {
+                    ctl.confirmed_fps = Some(
+                        ctl.confirmed_fps
+                            .map(|c| c.max(measured))
+                            .unwrap_or(measured),
+                    );
+                }
+            } else {
+                // A backlog is the evidence that the remembered rate is too high after all. Drop
+                // it rather than letting it hold the probe up on a link that has since got worse.
+                ctl.confirmed_fps = None;
+            }
         }
+        // What the target should be is the question `target_fps` answers; it needs the
+        // confirmed floor gathered above, so the decision is made once that has settled.
+        let confirmed = self
+            .video_threads
+            .values()
+            .filter(|v| v.fps_control.inactive_counter < inactive_threshold)
+            .filter_map(|v| v.fps_control.confirmed_fps)
+            .min();
+        let limited_fps = target_fps(queue_idle, direct, min_decode_fps, confirmed, custom_fps);
         let last_auto_fps = self.last_auto_fps;
         let displays = self.video_threads.keys().cloned().collect::<Vec<_>>();
         let mut fps_trending = |display: usize| {
@@ -1602,7 +1629,12 @@ impl<T: InvokeUiSession> Remote<T> {
             }
             if len <= 1 {
                 ctl.idle_counter += 1;
-                if ctl.idle_counter > 3 && last_auto_fps + 3 <= limited_fps {
+                // Any headroom above the current target is worth taking here: the probe only
+                // offers a tenth more each second, so requiring a three-frame margin as well would
+                // need a gap the loop cannot produce - the measured rate never exceeds what was
+                // asked for. The idle counter and the empty queue are the hysteresis; a backlog
+                // pulls the target straight back down.
+                if ctl.idle_counter > 3 && last_auto_fps < limited_fps {
                     return Some(true);
                 }
             }
@@ -3140,6 +3172,41 @@ struct FpsControl {
     last_refresh_instant: Option<Instant>,
     idle_counter: usize,
     inactive_counter: usize,
+    /// Highest rate the link has been seen to deliver without a backlog building up. The measured
+    /// rate alone cannot serve as a target: it is what the sender was asked for, so holding the
+    /// requested rate one step under it would never let the two rise, however much the link
+    /// improves. A rate that a clean queue confirmed is safe to try again later.
+    confirmed_fps: Option<usize>,
+}
+
+/// The frame rate to ask the sender for.
+///
+/// `min_decode_fps` is the measured arrival rate, which is what the sender was last asked for
+/// rather than what the link could carry. Using it as the target directly would hold the stream
+/// one step below itself forever, so an empty queue instead asks for a step past it: nothing is
+/// waiting, so nothing has yet shown that rate to be too high. `confirmed_fps` is the highest rate
+/// a clean queue has already vouched for, which keeps the probe from dropping below a level the
+/// link is known to carry.
+fn target_fps(
+    queue_idle: bool,
+    direct: bool,
+    min_decode_fps: usize,
+    confirmed_fps: Option<usize>,
+    custom_fps: usize,
+) -> usize {
+    let mut fps = if queue_idle {
+        let probe = min_decode_fps + (min_decode_fps / 10).max(1);
+        confirmed_fps.map(|c| probe.max(c)).unwrap_or(probe)
+    } else if direct {
+        // A backlog reintroduces the margin: decoding has to stay ahead of encoding.
+        min_decode_fps * 9 / 10
+    } else {
+        min_decode_fps * 4 / 5
+    };
+    if fps > custom_fps {
+        fps = custom_fps;
+    }
+    fps
 }
 
 struct VideoThread {
@@ -3242,7 +3309,9 @@ mod tests {
             },
         );
 
-        for (manual_fps, expected) in [(None, 20), (Some(90), 90), (None, 20)] {
+        // The queue is empty throughout, so the target is the probe above the measured rate
+        // rather than the margin below it: 23 + 23/10 = 25.
+        for (manual_fps, expected) in [(None, 25), (Some(90), 90), (None, 25)] {
             if let Some(fps) = manual_fps {
                 let lc = &remote.handler.lc;
                 let msg = lc.write().unwrap().set_custom_fps(fps, false);
@@ -3262,6 +3331,56 @@ mod tests {
             let msg = Message::parse_from_bytes(&bytes).unwrap();
             assert_eq!(msg.misc().option().custom_fps, expected);
         }
+    }
+
+    /// The measured rate is what the sender was last asked for, so a target taken from it
+    /// directly can only ask for less. Feeding each request back as the next measurement
+    /// leaves the target with no way up, and the stream settles wherever it started.
+    #[tokio::test]
+    async fn automatic_fps_climbs_out_of_the_rate_it_measured() {
+        let (mut remote, mut peer, mut far) = remote_and_peer().await;
+        let (video_sender, _video_receiver) = std::sync::mpsc::channel();
+        let decode_fps = Arc::new(RwLock::new(Some(20)));
+        remote.video_threads.insert(
+            0,
+            VideoThread {
+                video_queue: Arc::new(RwLock::new(ArrayQueue::new(client::VIDEO_QUEUE_SIZE))),
+                video_sender,
+                decode_fps: decode_fps.clone(),
+                frame_count: Default::default(),
+                discard_queue: Default::default(),
+                fps_control: Default::default(),
+            },
+        );
+
+        let mut requested = None;
+        let mut observed = Vec::new();
+        for _ in 0..20 {
+            if let Some(fps) = requested {
+                *decode_fps.write().unwrap() = Some(fps);
+            }
+            remote
+                .fps_control(true, HashMap::from([(0, 20)]), &mut peer)
+                .await;
+            // A round reports only when the target moved, so a quiet round is expected.
+            if let Ok(Some(Ok(bytes))) = timeout(50, far.next()).await {
+                let msg = Message::parse_from_bytes(&bytes).unwrap();
+                let fps = msg.misc().option().custom_fps as usize;
+                requested = Some(fps);
+                observed.push(fps);
+            }
+        }
+        assert!(
+            observed.len() > 3,
+            "the target stopped moving after {:?}",
+            observed
+        );
+        assert_eq!(
+            observed.last().copied(),
+            Some(30),
+            "the target never reached the user's limit: {:?}",
+            observed
+        );
     }
 }
 

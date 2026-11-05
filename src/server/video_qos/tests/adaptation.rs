@@ -89,3 +89,60 @@ fn static_to_dynamic_ratio_recovery() {
         }
     }
 }
+
+#[test]
+fn shedding_frames_lowers_quality_while_the_probe_stays_healthy() {
+    // Shedding is congestion the round trip cannot report: the queue stays short because the
+    // frames were thrown away, so every delay sample reads like a healthy link. Without the
+    // shed evidence the controller would hold both bitrate and rate and go on shedding.
+    let mut qos = session(true);
+    for _ in 0..90 {
+        second(&mut qos, 10, true);
+    }
+    let target = qos.latest_quality().ratio();
+    assert_eq!(qos.ratio(), target);
+
+    // Every interval sheds, and every delay reply still arrives at 10 ms.
+    for _ in 0..30 {
+        for _ in 0..2 {
+            qos.user_video_frame_shed(1);
+        }
+        second(&mut qos, 10, true);
+    }
+    assert!(
+        qos.ratio() < target * 0.9,
+        "a link that keeps shedding must lose bitrate although its delay reads healthy: {} -> {}",
+        target,
+        qos.ratio()
+    );
+
+    // And the shedding stops once there is nothing left to prove: no further cut.
+    let after_shedding = qos.ratio();
+    for _ in 0..30 {
+        second(&mut qos, 10, true);
+    }
+    assert!(
+        qos.ratio() >= after_shedding,
+        "quality must recover once frames are no longer shed"
+    );
+}
+
+#[test]
+fn shedding_frames_lowers_the_rate_when_the_bitrate_cannot() {
+    // With no bitrate to give back, the frame rate is the only lever left. Shedding still has
+    // to be answered, or the link keeps dropping frames at a rate it was told to deliver.
+    let mut qos = session(false);
+    for _ in 0..90 {
+        second(&mut qos, 10, true);
+    }
+    assert_eq!(qos.fps(), FPS);
+    for _ in 0..2 {
+        qos.user_video_frame_shed(1);
+    }
+    second(&mut qos, 10, true);
+    assert!(
+        qos.fps() < FPS,
+        "shedding must lower the rate when the bitrate cannot absorb it: {}",
+        qos.fps()
+    );
+}
