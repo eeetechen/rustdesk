@@ -29,6 +29,10 @@ async fn observed_public(socket: &Arc<UdpSocket>, echo: SocketAddr) -> Option<So
 
 #[tokio::main]
 async fn main() {
+    // The sweep logs what it searched and what it saw at info level, which is the point of this
+    // probe: without a logger those lines go nowhere and a failed run cannot be told apart from
+    // a silent one. A debug build routes them through env_logger, so RUST_LOG decides.
+    hbb_common::init_log(false, "");
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("");
     let echo: SocketAddr = args.last().expect("echo addr").parse().expect("echo addr");
