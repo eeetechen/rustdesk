@@ -1133,12 +1133,21 @@ impl RendezvousMediator {
         // let ordinary relay traffic use the pool up. The v6 punch is not relayed with them - a
         // symmetric NAT on v4 says nothing about v6 - and its place is taken after the v4 one,
         // or it could be the last and leave the punch the peer counts on with none.
-        let relay_v4 = ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
-            || Config::get_nat_type() == NatType::SYMMETRIC as i32
-            || relay
-            || (config::is_disable_tcp_listen() && ph.udp_port <= 0);
+        // A symmetric NAT no longer ends the attempt on its own. It makes the peer's ports
+        // unreachable by name, but their block is still searchable, and that search is what the
+        // punch below now does - on either side, since either NAT can be the one allocating a
+        // fresh port for this session. What still relays is a request that says so, a proxy, and
+        // a controlled end with no listening transport left to punch with.
+        let relay_v4 = relay || (config::is_disable_tcp_listen() && ph.udp_port <= 0);
         let punch_udp = !relay_v4 && ph.udp_port > 0;
         let punch_tcp = !relay_v4 && ph.udp_port <= 0 && ph.webrtc_sdp_offer.is_empty();
+        // The peer's anchor is the port it reported for its rendezvous server; the mapping it
+        // will get for us sits in a dense block around it, one the peer cannot name and we
+        // cannot guess, so both sides scan and let the two scans meet.
+        let symmetric = !relay_v4
+            && ph.udp_port > 0
+            && (ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
+                || Config::get_nat_type() == NatType::SYMMETRIC as i32);
         let punch_v6 = peer_addr_v6.port() > 0 && !relay;
         let (slot_udp, slot_v6) = UDP_PUNCHES.take_pair(punch_udp, punch_v6);
         let slot_tcp = punch_tcp.then(|| TCP_PUNCHES.take()).flatten();
@@ -1188,7 +1197,21 @@ impl RendezvousMediator {
             webrtc_sdp_answer,
             ..Default::default()
         };
-        if ph.udp_port > 0 {
+        if symmetric {
+            // The scan runs on its own task and the TCP punch below still runs: a scan can take
+            // seconds, and the peer may answer TCP in the meantime, since one symmetric
+            // classification describes one transport's mapping, not whether the peer is
+            // reachable at all.
+            self.punch_udp_symmetric_hole(
+                peer_addr,
+                ph.udp_port as u16,
+                server.clone(),
+                msg_punch.clone(),
+                meta.clone(),
+                slot_udp,
+            )
+            .await?;
+        } else if ph.udp_port > 0 {
             peer_addr.set_port(ph.udp_port as u16);
             self.punch_udp_hole(peer_addr, server, msg_punch, meta, slot_udp)
                 .await?;
@@ -1238,6 +1261,73 @@ impl RendezvousMediator {
             return Ok(());
         };
         punch_tcp_until_connected(server, peer_addr, local_addr, meta, slot).await;
+        Ok(())
+    }
+
+    /// Sends the reply and then searches the peer's block of UDP ports for an open one.
+    ///
+    /// A symmetric NAT gives the peer's mapping for this server and its mapping for us different
+    /// ports, so `ph.udp_port` and `peer_addr` name ports we can send to but never hear back
+    /// from. What survives is the block they are allocated out of: it is dense and it moves by a
+    /// bounded offset, so searching a window around the anchor finds the mapping the peer's NAT
+    /// will make for us. The peer searches our block at the same time, and the two scans meet on
+    /// the one pair of ports both NATs have open.
+    async fn punch_udp_symmetric_hole(
+        &self,
+        peer_addr: SocketAddr,
+        peer_anchor: u16,
+        server: ServerPtr,
+        msg_punch: PunchHoleSent,
+        meta: ConnectionMeta,
+        slot: Option<PunchSlot>,
+    ) -> ResultType<()> {
+        let mut msg_out = Message::new();
+        msg_out.set_punch_hole_sent(msg_punch);
+        let (socket, addr) = new_direct_udp_for(&self.host).await?;
+        let data = msg_out.write_to_bytes()?;
+        socket.send_to(&data, addr).await?;
+        let Some(slot) = slot else {
+            hbb_common::throttled_log!(
+                PUNCH_LOG_INTERVAL,
+                warn,
+                "declined a symmetric UDP punch: {} UDP punches already in flight",
+                UDP_PUNCHES.max
+            );
+            return Ok(());
+        };
+        let socket_cloned = socket.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let tm = (hbb_common::time_based_rand() % 20 + 10) as f32 / 1000.;
+                hbb_common::sleep(tm).await;
+                socket.send_to(&data, addr).await.ok();
+            }
+        });
+        // The search runs on its own task so the caller can go on with its TCP punch: on a peer
+        // that answers TCP after all, that punch is a faster answer than any scan.
+        tokio::spawn(async move {
+            let found =
+                crate::punch_udp_symmetric(socket_cloned.clone(), peer_addr.ip(), peer_anchor)
+                    .await;
+            let Some(peer) = found else {
+                hbb_common::throttled_log!(
+                    PUNCH_LOG_INTERVAL,
+                    info,
+                    "symmetric UDP punch to {} found nothing; leaving the place to the next punch",
+                    peer_addr.ip()
+                );
+                return;
+            };
+            log::info!(
+                "symmetric UDP punch: peer answered from {}, attaching KCP",
+                peer
+            );
+            if let Err(e) = socket_cloned.connect(peer).await {
+                log::info!("symmetric UDP punch: connect to {} failed: {e}", peer);
+                return;
+            }
+            allow_err!(udp_nat_listen(socket_cloned, peer, peer_addr, server, meta, slot).await);
+        });
         Ok(())
     }
 

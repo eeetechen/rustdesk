@@ -3007,6 +3007,130 @@ pub async fn punch_udp(
     }
 }
 
+// A symmetric NAT gives the same socket a different public port for every destination it talks
+// to, so the port the rendezvous server reports - measured against the rendezvous server itself -
+// says nothing about the port the same socket gets when it talks to the peer. The peer therefore
+// cannot aim at the reported port; it has to search. The measurements that led to this window are
+// in docs/RustDesk-连接层国内网络优化.md: against one destination a burst of new sockets lands on
+// a contiguous block that grows by about one port per socket, while the block at a *different*
+// destination sits 226 to 724 ports lower, so covering the peer's block needs a window a little
+// wider than that offset and the burst together.
+pub const SYMMETRIC_PUNCH_WINDOW: u16 = 2048;
+// Probing pace. The window is two thousand ports and the search has to cross it more than once,
+// because a port skipped by a lost probe is a port the peer may be sitting on; two milliseconds
+// buys two passes inside the budget below at about 500 packets a second, a rate a NAT will pass.
+const SYMMETRIC_PUNCH_INTERVAL: Duration = Duration::from_millis(2);
+// How long the search runs. It has to outlast the peer's own sweep: both ends start within one
+// rendezvous round trip of each other, and each needs the other to have created its mappings
+// before a probe can land, so the two sweeps must overlap in time rather than merely exist.
+pub const SYMMETRIC_PUNCH_TIME: Duration = Duration::from_secs(10);
+
+/// Where in a symmetric NAT's per-destination port block to look for the peer.
+///
+/// `anchor` is the public port the rendezvous server saw, which is where the block for the
+/// rendezvous server sits. The block for the peer is offset from it, and the offset was measured
+/// as negative and unstable - it moved by 498 ports between trials - so the window opens below
+/// the anchor and runs past it, rather than starting at it and going up.
+fn symmetric_punch_window(anchor: u16) -> (u16, u16) {
+    let half = SYMMETRIC_PUNCH_WINDOW / 2;
+    let start = anchor.saturating_sub(half);
+    let end = anchor.saturating_add(half);
+    (start, end)
+}
+
+/// Searches the peer's likely port block for a hole that opens in both directions.
+///
+/// Both ends run this and both sweep, which is what makes it work on a symmetric NAT: our probes
+/// leave through a block of ports the peer is sweeping, and the peer's probes arrive at ports we
+/// are sweeping, so the two sweeps cross on a pair of ports that both NATs will now carry the
+/// other side's traffic through.
+///
+/// Returns the peer address that answered, or None when the window closed without an answer. The
+/// caller then connects that address and hands the socket to KCP as usual: the search only has to
+/// find a port pair the NATs will pass, and connecting pins the socket to it for everything after.
+///
+/// `anchor` is our own public port as the rendezvous server saw it. Both ends need the other's,
+/// which is why the protocol carries it.
+pub async fn punch_udp_symmetric(
+    socket: Arc<UdpSocket>,
+    peer_ip: std::net::IpAddr,
+    peer_anchor: u16,
+) -> Option<std::net::SocketAddr> {
+    let tid = ((hbb_common::time_based_rand() as u64) << 32) | hbb_common::time_based_rand() as u64;
+    let probe = punch_packet(&PUNCH_PROBE, tid);
+    let (start, end) = symmetric_punch_window(peer_anchor);
+    let mut data = [0u8; 1500];
+    while socket.try_recv(&mut data).is_ok() {}
+    let tm = Instant::now();
+    let deadline = tm + SYMMETRIC_PUNCH_TIME;
+    let mut next_probe = tm;
+    let mut probes_sent = 0u32;
+    let mut probes_seen = 0u32;
+    // Sweeping from a random point rather than from the bottom: both ends sweeping upward from
+    // their own anchor would cross at the same offset every time, and an offset that happens to
+    // be blocked would fail the same way forever.
+    let mut port =
+        start + (hbb_common::time_based_rand() as u32 % SYMMETRIC_PUNCH_WINDOW as u32) as u16;
+    log::info!(
+        "symmetric punch: searching {}..{} for peer {} anchor {}, {} probes planned",
+        start,
+        end,
+        peer_ip,
+        peer_anchor,
+        (SYMMETRIC_PUNCH_TIME.as_millis() / SYMMETRIC_PUNCH_INTERVAL.as_millis()) as u64
+    );
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                log::info!(
+                    "symmetric punch: window {}..{} closed after {:?}, {} probes sent, {} peer probes seen",
+                    start, end, tm.elapsed(), probes_sent, probes_seen
+                );
+                return None;
+            }
+            _ = tokio::time::sleep_until(next_probe) => {
+                let target = std::net::SocketAddr::new(peer_ip, port);
+                // Every port in the window is tried three times before the sweep repeats: one
+                // lost probe would otherwise leave a port that works untested for a whole pass.
+                if let Err(e) = socket.send_to(&probe, target).await {
+                    if probes_sent == 0 {
+                        log::debug!("symmetric punch: send to {} failed: {e}", target);
+                    }
+                } else {
+                    probes_sent += 1;
+                }
+                port = if port >= end { start } else { port + 1 };
+                next_probe = Instant::now() + SYMMETRIC_PUNCH_INTERVAL;
+            }
+            res = socket.recv_from(&mut data) => {
+                let Ok((n, from)) = res else { continue };
+                if from.ip() != peer_ip {
+                    continue;
+                }
+                if let Some(peer_tid) = punch_tid(&data[..n], &PUNCH_PROBE) {
+                    probes_seen += 1;
+                    // Answer from the same socket, so the peer's NAT learns the mapping too. The
+                    // answer goes to the address the probe came from, not to a guess.
+                    socket.send_to(&punch_packet(&PUNCH_ACK, peer_tid), from).await.ok();
+                    if probes_seen == 1 {
+                        log::info!("symmetric punch: first peer probe from {from}, answering");
+                    }
+                    continue;
+                }
+                if punch_tid(&data[..n], &PUNCH_ACK) == Some(tid) || n > PUNCH_PACKET_LEN {
+                    // Either our own probe came back answered, or the peer is already speaking
+                    // KCP through the hole. Both mean this address carries traffic both ways.
+                    log::info!(
+                        "symmetric punch: hole open to {from} after {:?}, {} probes sent, {} peer probes seen",
+                        tm.elapsed(), probes_sent, probes_seen
+                    );
+                    return Some(from);
+                }
+            }
+        }
+    }
+}
+
 fn test_ipv6_sync() {
     #[tokio::main(flavor = "current_thread")]
     async fn func() {
@@ -3645,5 +3769,64 @@ mod tests {
         // `decode_id_pk` is the same blob minus the fingerprint, so the field is invisible to
         // non-WebRTC handshakes.
         assert_eq!(decode_id_pk(&signed, &pk).unwrap(), (id, their_pk));
+    }
+
+    #[test]
+    fn symmetric_punch_window_brackets_the_anchor() {
+        // The window exists to cover an offset that is not known in advance and was measured as
+        // negative, so the anchor has to sit inside it rather than at an edge.
+        let (start, end) = symmetric_punch_window(20000);
+        assert!(start < 20000 && 20000 < end);
+        assert_eq!(end - start, SYMMETRIC_PUNCH_WINDOW);
+    }
+
+    #[test]
+    fn symmetric_punch_window_stays_in_range_near_zero() {
+        // A public port can be small, and half a window below it must clamp instead of wrapping
+        // into 65535, where the sweep would run away from the anchor entirely.
+        let (start, end) = symmetric_punch_window(10);
+        assert_eq!(start, 0);
+        assert!(end > 10);
+        assert!(end <= SYMMETRIC_PUNCH_WINDOW / 2 + 10);
+    }
+
+    #[test]
+    fn symmetric_punch_window_fits_two_passes_in_its_budget() {
+        // A port skipped by a lost probe is a port the peer may be sitting on, so the sweep has to
+        // cross the window more than once inside the time the peer is also sweeping.
+        let probes = SYMMETRIC_PUNCH_TIME.as_millis() / SYMMETRIC_PUNCH_INTERVAL.as_millis();
+        assert!(
+            probes >= (SYMMETRIC_PUNCH_WINDOW as u128) * 2,
+            "only {probes} probes fit in {:?}, not two passes over {} ports",
+            SYMMETRIC_PUNCH_TIME,
+            SYMMETRIC_PUNCH_WINDOW
+        );
+    }
+
+    #[tokio::test]
+    async fn symmetric_punch_finds_the_peer_from_either_end() {
+        // Two ends sweep each other's windows at once and each has to come away with the other's
+        // address. On a symmetric NAT neither can name the port the other will see, which is why
+        // both sweep; here the sockets are bound to the anchors being searched for, so the test
+        // is the same two-way sweep without a NAT to move the ports.
+        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (a_anchor, b_anchor) = (
+            a.local_addr().unwrap().port(),
+            b.local_addr().unwrap().port(),
+        );
+        let (a_ip, b_ip) = (a.local_addr().unwrap().ip(), b.local_addr().unwrap().ip());
+        let a_task = tokio::spawn(punch_udp_symmetric(b.clone(), a_ip, a_anchor));
+        let b_task = tokio::spawn(punch_udp_symmetric(a.clone(), b_ip, b_anchor));
+        let (a_found, b_found) = tokio::join!(a_task, b_task);
+        // Each side's outcome depends on whether the other's probe reached it, and the two sweeps
+        // are independent, so at least one of them has to have completed the exchange: the first
+        // probe that lands is answered, and that answer is what the sender was waiting for.
+        let found = a_found.ok().flatten().or_else(|| b_found.ok().flatten());
+        assert!(
+            found.is_some(),
+            "neither end completed the sweep: {:?}",
+            found
+        );
     }
 }

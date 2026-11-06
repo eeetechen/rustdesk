@@ -1460,7 +1460,16 @@ impl Client {
                 connect_timeout = MIN;
             }
         }
-        log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
+        // Either side being symmetric turns the UDP punch from an aimed probe into a search: the
+        // port that was reported is a mapping for the rendezvous server, not for the peer.
+        let is_symmetric =
+            peer_nat_type == NatType::SYMMETRIC || my_nat_type == NatType::SYMMETRIC as i32;
+        log::info!(
+            "peer address: {}, timeout: {}, symmetric search: {}",
+            peer,
+            connect_timeout,
+            is_symmetric
+        );
         let start = std::time::Instant::now();
 
         // Each attempt carries whether its path is direct (4th field). TCP/UDP/IPv6 punch are
@@ -1472,6 +1481,24 @@ impl Client {
                 async move {
                     let conn = fut.await?;
                     Ok((conn, None, "TCP", true))
+                }
+                .boxed(),
+            );
+        }
+        // A symmetric peer's reported port is not a port it can be reached on - its NAT gives us
+        // a different one - but the block it is allocated out of is dense and moves by a bounded
+        // offset, so the peer's port is the anchor of a range worth searching. The peer searches
+        // ours at the same time, and the two scans meet on the pair both NATs have opened.
+        if let Some(udp_socket_nat) = udp_socket_nat.clone().filter(|_| is_symmetric) {
+            let peer_ip = peer.ip();
+            let peer_anchor = peer.port();
+            let scan_timeout = symmetric_punch_budget_ms();
+            direct_futures.push(
+                async move {
+                    let (conn, kcp, typ) =
+                        udp_symmetric_connect(udp_socket_nat, peer_ip, peer_anchor, scan_timeout)
+                            .await?;
+                    Ok((conn, kcp, typ, true))
                 }
                 .boxed(),
             );
@@ -5567,6 +5594,42 @@ async fn test_udp_uat(
         final_port > 0
     );
     Ok(())
+}
+
+/// How long the symmetric search may run before it is abandoned for another transport.
+///
+/// The search has to outlast both scans: the two ends start within a rendezvous round trip of
+/// each other, and each scan has to cover its whole window before the pair of ports both NATs
+/// opened can be found. The punch budget alone is too short - it is sized for an aimed probe.
+fn symmetric_punch_budget_ms() -> u64 {
+    (crate::SYMMETRIC_PUNCH_TIME.as_millis() as u64).saturating_add(2_000)
+}
+
+#[inline]
+async fn udp_symmetric_connect(
+    socket: Arc<UdpSocket>,
+    peer_ip: std::net::IpAddr,
+    peer_anchor: u16,
+    ms_timeout: u64,
+) -> ResultType<(Stream, Option<KcpStream>, &'static str)> {
+    let found = crate::punch_udp_symmetric(socket.clone(), peer_ip, peer_anchor)
+        .await
+        .ok_or_else(|| {
+            hbb_common::anyhow::anyhow!(
+                "symmetric UDP punch to {} around port {} found no open port",
+                peer_ip,
+                peer_anchor
+            )
+        })?;
+    // The scan leaves the socket unconnected so it can hear every port in the window; KCP sends
+    // on one peer, so it is bound to the port the peer answered from afterwards.
+    socket.connect(found).await?;
+    log::info!("symmetric UDP punch: KCP attaching to {}", found);
+    let remaining_ms = ms_timeout
+        .saturating_sub(crate::SYMMETRIC_PUNCH_TIME.as_millis() as u64)
+        .max(2_000);
+    let (kcp, stream) = KcpStream::connect(socket, Duration::from_millis(remaining_ms)).await?;
+    Ok((stream, Some(kcp), "UDP"))
 }
 
 #[inline]
